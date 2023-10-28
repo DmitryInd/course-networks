@@ -1,18 +1,21 @@
 import socket
 import logging
+import time
 from queue import PriorityQueue
 
 logger = logging.getLogger(__name__)
 
 
 class TCPSegment:
-    service_len = 8 + 8 + 1
+    service_len = 8 + 8
+    ack_timeout = 0.05
 
     def __init__(self, seq_number: int, ack_number: int, data: bytes):
-        # TODO: ввести время создания сегмента и проверку истечения срока годности
         self.seq_number = seq_number
         self.ack_number = ack_number
         self.data = data
+        self.acknowledged = False
+        self._sending_time = time.time()
 
     def dump(self) -> bytes:
         seq = self.seq_number.to_bytes(8, "big", signed=False)
@@ -24,6 +27,13 @@ class TCPSegment:
         seq = int.from_bytes(data[:8], "big", signed=False)
         ack = int.from_bytes(data[8:16], "big", signed=False)
         return TCPSegment(seq, ack, data[16:])
+
+    def update_sending_time(self, sending_time=None):
+        self._sending_time = sending_time if sending_time is not None else time.time()
+
+    @property
+    def expired(self):
+        return not self.acknowledged and (time.time() - self._sending_time > self.ack_timeout)
 
     def __len__(self):
         return len(self.data)
@@ -49,59 +59,97 @@ class MyTCPProtocol(UDPBasedProtocol):
         # Hyperparameters
         self.mss = 1500
         self.window_size = self.mss * 12
-        self.read_timeout = 10
-        self.ack_timeout = 0.05
+        self.read_timeout = 2
         # Internal buffers
         self._sent_bytes_n = 0
         self._confirmed_bytes_n = 0
-        self._received_bytes = 0
+        self._received_bytes_n = 0
         self._send_window = PriorityQueue()
         self._recv_window = PriorityQueue()
         self._buffer = bytes()
 
     def send(self, data: bytes) -> int:
+        window_lock = (self._sent_bytes_n - self._confirmed_bytes_n > self.window_size)
         while data:
-            right_border = min(self.mss, len(data))
-            sent_length = self.send_segment(TCPSegment(self._sent_bytes_n,
-                                                       self._confirmed_bytes_n,
-                                                       data[: right_border]))
-            data = data[sent_length:]
-            is_blocking = (self._sent_bytes_n - self._confirmed_bytes_n > self.window_size)
-            ack_datagram = self.receive_segment(self.ack_timeout if is_blocking else 0.0)
-            # TODO Сдвинуть окно и настроить получение датаграммы
+            if not window_lock:
+                right_border = min(self.mss, len(data))
+                sent_length = self._send_segment(TCPSegment(self._sent_bytes_n,
+                                                            self._confirmed_bytes_n,
+                                                            data[: right_border]))
+                data = data[sent_length:]
+            window_lock = (self._sent_bytes_n - self._confirmed_bytes_n > self.window_size)
+            self._receive_segment(TCPSegment.ack_timeout if window_lock else 0.0)
+            self._resend_earliest_segment()
+
         return self._sent_bytes_n
 
     def recv(self, n: int):
+        right_border = min(n, len(self._buffer))
+        data = self._buffer[:right_border]
+        self._buffer = self._buffer[right_border:]
+        while len(data) < n:
+            self._receive_segment(self.read_timeout)
+            right_border = min(n, len(self._buffer))
+            data = self._buffer[:right_border]
+            self._buffer = self._buffer[right_border:]
         return self.recvfrom(n)
 
-    def receive_segment(self, timeout: float = None) -> TCPSegment:
+    def _receive_segment(self, timeout: float = None) -> TCPSegment:
         self.udp_socket.settimeout(timeout)
         try:
-            datagram = TCPSegment.load(self.recvfrom(self.mss))
-            if len(datagram):
-                self._recv_window.put((datagram.seq_number, datagram))
+            segment = TCPSegment.load(self.recvfrom(self.mss))
         except socket.error:
-            datagram = TCPSegment(-1, -1, bytes())
+            segment = TCPSegment(-1, -1, bytes())
 
-        while len(datagram):
-            newest_segment = self._recv_window.get()
-            if newest_segment.seq_number == self._received_bytes:
-                self._buffer += newest_segment.data
-                self._received_bytes += len(newest_segment)
-                self.send_segment(TCPSegment(self._sent_bytes_n, self._received_bytes, bytes()))
-            elif newest_segment.seq_number > self._received_bytes:
-                self._recv_window.put(newest_segment)
-                break
+        if len(segment):
+            self._recv_window.put((segment.seq_number, segment))
+            self._shift_recv_window()
+        if segment.ack_number > self._confirmed_bytes_n:
+            self._confirmed_bytes_n = segment.ack_number
+            self._shift_send_window()
 
-        # TODO: сдвиг окна отправленных данных
-        return datagram
+        return segment
 
-    def send_segment(self, datagram: TCPSegment):
+    def _send_segment(self, segment: TCPSegment) -> int:
+        """
+        @return: длина отправленных данных
+        """
         # В будущем обернуть в try: ... except socket.error: just_sent = 0
         self.udp_socket.settimeout(None)
-        just_sent = self.sendto(datagram.dump()) - datagram.service_len
+        just_sent = self.sendto(segment.dump()) - segment.service_len
         self._sent_bytes_n += just_sent
-        datagram.data = datagram.data[: just_sent]
-        if len(datagram):
-            self._send_window.put((datagram.seq_number, datagram))
+        segment.data = segment.data[: just_sent]
+        if len(segment):
+            segment.update_sending_time()
+            self._send_window.put((segment.seq_number, segment))
         return just_sent
+
+    def _shift_recv_window(self):
+        earliest_segment = None
+        while not self._recv_window.empty():
+            earliest_segment = self._recv_window.get(block=False)
+            if earliest_segment.seq_number == self._received_bytes_n:
+                self._buffer += earliest_segment.data
+                self._received_bytes_n += len(earliest_segment)
+                earliest_segment.acknowledged = True
+            elif earliest_segment.seq_number > self._received_bytes_n:
+                self._recv_window.put(earliest_segment)
+                break
+
+        if earliest_segment is not None and earliest_segment.acknowledged:
+            self._send_segment(TCPSegment(self._sent_bytes_n, self._received_bytes_n, bytes()))
+
+    def _shift_send_window(self):
+        while not self._send_window.empty():
+            earliest_segment = self._send_window.get(block=False)
+            if earliest_segment.ack_number > self._confirmed_bytes_n:
+                self._send_window.put(earliest_segment)
+                break
+
+    def _resend_earliest_segment(self):
+        if self._send_window.empty():
+            return
+        earliest_segment = self._send_window.get(block=False)
+        if earliest_segment.expired:
+            self._send_segment(earliest_segment)
+
