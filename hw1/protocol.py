@@ -60,6 +60,8 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.mss = 1500
         self.window_size = self.mss * 12
         self.read_timeout = 2
+        self.lag = 0
+        self.critical_lag = 12
         # Internal buffers
         self._sent_bytes_n = 0
         self._confirmed_bytes_n = 0
@@ -107,6 +109,11 @@ class MyTCPProtocol(UDPBasedProtocol):
         if segment.ack_number > self._confirmed_bytes_n:
             self._confirmed_bytes_n = segment.ack_number
             self._shift_send_window()
+        elif self.lag < self.critical_lag:
+            self.lag += 1
+        else:
+            self.lag = 0
+            self._resend_earliest_segment(force=True)
 
         return segment
 
@@ -127,13 +134,13 @@ class MyTCPProtocol(UDPBasedProtocol):
     def _shift_recv_window(self):
         earliest_segment = None
         while not self._recv_window.empty():
-            earliest_segment = self._recv_window.get(block=False)
+            _, earliest_segment = self._recv_window.get(block=False)
             if earliest_segment.seq_number == self._received_bytes_n:
                 self._buffer += earliest_segment.data
                 self._received_bytes_n += len(earliest_segment)
                 earliest_segment.acknowledged = True
             elif earliest_segment.seq_number > self._received_bytes_n:
-                self._recv_window.put(earliest_segment)
+                self._recv_window.put((earliest_segment.seq_number, earliest_segment))
                 break
 
         if earliest_segment is not None and earliest_segment.acknowledged:
@@ -141,15 +148,17 @@ class MyTCPProtocol(UDPBasedProtocol):
 
     def _shift_send_window(self):
         while not self._send_window.empty():
-            earliest_segment = self._send_window.get(block=False)
+            _, earliest_segment = self._send_window.get(block=False)
             if earliest_segment.ack_number > self._confirmed_bytes_n:
-                self._send_window.put(earliest_segment)
+                self._send_window.put((earliest_segment.seq_number, earliest_segment))
                 break
 
-    def _resend_earliest_segment(self):
+    def _resend_earliest_segment(self, force=False):
         if self._send_window.empty():
             return
-        earliest_segment = self._send_window.get(block=False)
-        if earliest_segment.expired:
+        _, earliest_segment = self._send_window.get(block=False)
+        if earliest_segment.expired or force:
             self._send_segment(earliest_segment)
+        else:
+            self._send_window.put((earliest_segment.seq_number, earliest_segment))
 
