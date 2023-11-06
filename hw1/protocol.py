@@ -5,7 +5,7 @@ from queue import PriorityQueue
 
 class TCPSegment:
     service_len = 8 + 8
-    ack_timeout = 0.05
+    ack_timeout = 0.01
 
     def __init__(self, seq_number: int, ack_number: int, data: bytes):
         self.seq_number = seq_number
@@ -34,6 +34,12 @@ class TCPSegment:
 
     def __len__(self):
         return len(self.data)
+
+    def __lt__(self, other):
+        return self.seq_number < other.seq_number
+
+    def __eq__(self, other):
+        return self.seq_number == other.seq_number
 
 
 class UDPBasedProtocol:
@@ -68,10 +74,10 @@ class MyTCPProtocol(UDPBasedProtocol):
         self._buffer = bytes()
 
     def send(self, data: bytes) -> int:
-        window_lock = (self._sent_bytes_n - self._confirmed_bytes_n > self.window_size)
         sent_data_len = 0
         lag = 0
         while (data or self._confirmed_bytes_n < self._sent_bytes_n) and (lag < self.ack_crit_lag):
+            window_lock = (self._sent_bytes_n - self._confirmed_bytes_n > self.window_size)
             if not window_lock and data:
                 right_border = min(self.mss, len(data))
                 sent_length = self._send_segment(TCPSegment(self._sent_bytes_n,
@@ -79,34 +85,32 @@ class MyTCPProtocol(UDPBasedProtocol):
                                                             data[: right_border]))
                 data = data[sent_length:]
                 sent_data_len += sent_length
-
-            window_lock = (self._sent_bytes_n - self._confirmed_bytes_n > self.window_size)
-            if window_lock or not data:
+                self._receive_segment(0.)
+            else:
                 # Для дальнейшей работы нужно подтвердить доставку сообщения
                 lst_recv_seg = self._receive_segment(TCPSegment.ack_timeout)
                 if lst_recv_seg.seq_number == -1:
                     # Пакеты были потеряны в сети или получатель не следит больше за ней
-                    print(f"{self.name} doesn't hear receiver! ")
+                    # print(f"{self.name} doesn't hear receiver! ")
                     lag += 1
                 else:
                     # Получатель следит за сетью и присылает подтверждения
                     lag = 0
-            else:
-                self._receive_segment(0.)
-            self._resend_earliest_segment()
-            print(f'{self.name} surely sent {self._confirmed_bytes_n}/{self._sent_bytes_n}. ')
 
-        if lag < self.ack_crit_lag:
-            print(f'{self.name} surely sent all {self._sent_bytes_n} bytes. ')
-        else:
-            # Для более сложных сценариев лучше очищать _send_window и обновлять _confirmed_bytes_n
-            # Иначе при следующем взаимодействии соединение будет некоторое время "нагонять" рассинхронизацию состояний
-            print(f"{self.name} assumes that receiver is offline! ")
+            # print(f'{self.name} surely sent {self._confirmed_bytes_n}/{self._sent_bytes_n}. ')
+            self._resend_earliest_segment()
+
+        # if lag < self.ack_crit_lag:
+        #     print(f'{self.name} surely sent all {self._sent_bytes_n} bytes. ')
+        # else:
+        #     # Для более сложных сценариев лучше очищать _send_window и обновлять _confirmed_bytes_n
+        #     # Иначе при следующем взаимодействии соединение будет некоторое время "нагонять" рассинхронизацию состояний
+        #     print(f"{self.name} assumes that receiver is offline! ")
 
         return sent_data_len
 
     def recv(self, n: int):
-        print(f'{self.name} expects {n} bytes. ')
+        # # print(f'{self.name} expects {n} bytes. ')
         right_border = min(n, len(self._buffer))
         data = self._buffer[:right_border]
         self._buffer = self._buffer[right_border:]
@@ -115,8 +119,8 @@ class MyTCPProtocol(UDPBasedProtocol):
             right_border = min(n, len(self._buffer))
             data += self._buffer[:right_border]
             self._buffer = self._buffer[right_border:]
-            print(f'{self.name} have read {len(data)} bytes, totally {self._received_bytes_n} bytes. ')
-        print(f'{self.name} have read expected {n} bytes. ')
+            # print(f'{self.name} have read {len(data)} bytes, totally {self._received_bytes_n} bytes. ')
+        # print(f'{self.name} have read expected {n} bytes. ')
         return data
 
     def _receive_segment(self, timeout: float = None) -> TCPSegment:
@@ -127,7 +131,7 @@ class MyTCPProtocol(UDPBasedProtocol):
             segment = TCPSegment(-1, -1, bytes())
 
         if len(segment):
-            self._recv_window.put((segment.seq_number, segment))
+            self._recv_window.put((segment.seq_number, segment), block=False)
             self._shift_recv_window()
 
         if segment.ack_number > self._confirmed_bytes_n:
@@ -151,7 +155,7 @@ class MyTCPProtocol(UDPBasedProtocol):
         segment.data = segment.data[: just_sent]
         if len(segment):
             segment.update_sending_time()
-            self._send_window.put((segment.seq_number, segment))
+            self._send_window.put((segment.seq_number, segment), block=False)
 
         return just_sent
 
@@ -166,17 +170,19 @@ class MyTCPProtocol(UDPBasedProtocol):
                 self._received_bytes_n += len(earliest_segment)
                 earliest_segment.acknowledged = True
             else:
-                self._recv_window.put((earliest_segment.seq_number, earliest_segment))
+                self._recv_window.put((earliest_segment.seq_number, earliest_segment), block=False)
                 break
 
         if earliest_segment is not None:
+            # print(f'{self.name} sends acknowledge for {earliest_segment.seq_number} message. ')
             self._send_segment(TCPSegment(self._sent_bytes_n, self._received_bytes_n, bytes()))
 
     def _shift_send_window(self):
         while not self._send_window.empty():
             _, earliest_segment = self._send_window.get(block=False)
-            if earliest_segment.ack_number > self._confirmed_bytes_n:
-                self._send_window.put((earliest_segment.seq_number, earliest_segment))
+            if earliest_segment.seq_number >= self._confirmed_bytes_n:
+                # print(f'{self.name} is not sure about {earliest_segment.ack_number} message. ')
+                self._send_window.put((earliest_segment.seq_number, earliest_segment), block=False)
                 break
 
     def _resend_earliest_segment(self, force=False):
@@ -184,8 +190,8 @@ class MyTCPProtocol(UDPBasedProtocol):
             return
         _, earliest_segment = self._send_window.get(block=False)
         if earliest_segment.expired or force:
-            print(f'{self.name} sent {earliest_segment.seq_number} segment again! ')
+            # print(f'{self.name} sent {earliest_segment.seq_number} segment again! ')
             self._send_segment(earliest_segment)
         else:
-            self._send_window.put((earliest_segment.seq_number, earliest_segment))
+            self._send_window.put((earliest_segment.seq_number, earliest_segment), block=False)
 
