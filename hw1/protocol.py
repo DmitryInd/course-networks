@@ -95,16 +95,8 @@ class MyTCPProtocol(UDPBasedProtocol):
                 else:
                     # Получатель следит за сетью и присылает подтверждения
                     lag = 0
-
             # print(f'{self.name} surely sent {self._confirmed_bytes_n}/{self._sent_bytes_n}. ')
             self._resend_earliest_segment()
-
-        # if lag < self.ack_crit_lag:
-        #     print(f'{self.name} surely sent all {self._sent_bytes_n} bytes. ')
-        # else:
-        #     # Для более сложных сценариев лучше очищать _send_window и обновлять _confirmed_bytes_n
-        #     # Иначе при следующем взаимодействии соединение будет некоторое время "нагонять" рассинхронизацию состояний
-        #     print(f"{self.name} assumes that receiver is offline! ")
 
         return sent_data_len
 
@@ -120,6 +112,7 @@ class MyTCPProtocol(UDPBasedProtocol):
             self._buffer = self._buffer[right_border:]
             # print(f'{self.name} have read {len(data)} bytes, totally {self._received_bytes_n} bytes. ')
         # print(f'{self.name} have read expected {n} bytes. ')
+
         return data
 
     def _receive_segment(self, timeout: float = None) -> TCPSegment:
