@@ -63,7 +63,6 @@ class MyTCPProtocol(UDPBasedProtocol):
         # Hyperparameters
         self.mss = 1500
         self.window_size = self.mss * 12
-        self.read_timeout = 0.5
         self.ack_crit_lag = 20
         # Internal buffers
         self._sent_bytes_n = 0
@@ -115,7 +114,7 @@ class MyTCPProtocol(UDPBasedProtocol):
         data = self._buffer[:right_border]
         self._buffer = self._buffer[right_border:]
         while len(data) < n:
-            self._receive_segment(self.read_timeout)
+            self._receive_segment()
             right_border = min(n, len(self._buffer))
             data += self._buffer[:right_border]
             self._buffer = self._buffer[right_border:]
@@ -194,4 +193,3 @@ class MyTCPProtocol(UDPBasedProtocol):
             self._send_segment(earliest_segment)
         else:
             self._send_window.put((earliest_segment.seq_number, earliest_segment), block=False)
-
