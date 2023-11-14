@@ -138,7 +138,6 @@ class MyTCPProtocol(UDPBasedProtocol):
         # В будущем обернуть в try: ... except socket.error: just_sent = 0
         self.udp_socket.settimeout(None)
         just_sent = self.sendto(segment.dump()) - segment.service_len
-        segment.data = segment.data[: just_sent]
 
         if segment.seq_number == self._sent_bytes_n:
             self._sent_bytes_n += just_sent
@@ -147,6 +146,7 @@ class MyTCPProtocol(UDPBasedProtocol):
                              f'of sent messages: {self._sent_bytes_n}')
 
         if len(segment):
+            segment.data = segment.data[: just_sent]
             segment.update_sending_time()
             self._send_window.put((segment.seq_number, segment), block=False)
 
